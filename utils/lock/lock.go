@@ -16,12 +16,26 @@ import (
 	"github.com/jfrog/jfrog-client-go/utils/log"
 )
 
+const threeMinutes = 3 * 60 * 1000000000
+
+func getHostname() (hostname string) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	// We want only name without domain
+	return strings.SplitN(hostname, ".", 2)[0]
+}
+
 type Lock struct {
 	// The current time when the lock was created
 	currentTime int64
 	// The full path to the lock file.
 	fileName string
 	pid      int
+	// The hostname from which the file was created.
+	hostname string
 }
 
 type Locks []Lock
@@ -46,11 +60,12 @@ func (lock *Lock) createNewLockFile(lockDirPath string) error {
 		return err
 	}
 	lock.pid = os.Getpid()
+	lock.hostname = getHostname()
 	return lock.createFile(lockDirPath)
 }
 
 func (lock *Lock) getLockFilename(folderName string) string {
-	return filepath.Join(folderName, "jfrog-cli.conf.lck."+strconv.Itoa(lock.pid)+"."+strconv.FormatInt(lock.currentTime, 10))
+	return filepath.Join(folderName, "jfrog-cli.conf.lck."+lock.hostname+"."+strconv.Itoa(lock.pid)+"."+strconv.FormatInt(lock.currentTime, 10))
 }
 
 func (lock *Lock) createFile(folderName string) error {
@@ -85,25 +100,41 @@ func (lock *Lock) lock() error {
 		if err != nil {
 			return err
 		}
-		// If the first timestamp in the sorted locks slice is equal to this timestamp
-		// means that the lock can be acquired
-		if locks[0].currentTime == lock.currentTime {
-			// Edge case, if at the same time (by the nanoseconds) two different process created two files.
-			// We are checking the PID to know which process can run.
-			if locks[0].pid != lock.pid {
+		// In case, if at the same time two different hosts created two files,
+		// We are checking the hostname to know if the lock can be acquired.
+		if locks[0].hostname == lock.hostname {
+			// If the first timestamp in the sorted locks slice is equal to this timestamp
+			// means that the lock can be acquired
+			if locks[0].currentTime == lock.currentTime {
+				// Edge case, if at the same time (by the nanoseconds) two different process created two files.
+				// We are checking the PID to know which process can run.
+				if locks[0].pid != lock.pid {
+					err := lock.removeOtherLockOrWait(locks[0], &filesList)
+					if err != nil {
+						return err
+					}
+				} else {
+					log.Debug("Lock has been acquired for", lock.fileName)
+					return nil
+				}
+			} else {
 				err := lock.removeOtherLockOrWait(locks[0], &filesList)
 				if err != nil {
 					return err
 				}
-			} else {
-				log.Debug("Lock has been acquired for", lock.fileName)
-				return nil
 			}
-		} else {
-			err := lock.removeOtherLockOrWait(locks[0], &filesList)
+		} else if locks[0].currentTime <= lock.currentTime-threeMinutes {
+			err := locks[0].Unlock()
 			if err != nil {
 				return err
 			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+		// Update list of files
+		filesList, err = lock.getListOfFiles()
+		if err != nil {
+			return err
 		}
 		i++
 	}
@@ -169,21 +200,23 @@ func getLocks(filesList []string) (Locks, error) {
 		fileName := filepath.Base(path)
 		splitted := strings.Split(fileName, ".")
 
-		if len(splitted) != 5 {
+		if len(splitted) != 6 {
 			return nil, errorutils.CheckErrorf("Failed while parsing the file name: %s located at: %s. Expecting a different format.", fileName, path)
 		}
 		// Last element is the timestamp.
-		time, err := strconv.ParseInt(splitted[4], 10, 64)
+		time, err := strconv.ParseInt(splitted[5], 10, 64)
 		if err != nil {
 			return nil, errorutils.CheckError(err)
 		}
-		pid, err := strconv.Atoi(splitted[3])
+		pid, err := strconv.Atoi(splitted[4])
 		if err != nil {
 			return nil, errorutils.CheckError(err)
 		}
+		hostname := splitted[3]
 		file := Lock{
 			currentTime: time,
 			pid:         pid,
+			hostname:    hostname,
 			fileName:    path,
 		}
 		files = append(files, file)
